@@ -1,0 +1,81 @@
+// ESP32 Dynamic iBeacon with Minor Rotation
+// "Zoom-style" heartbeat beacon for anti-proxy attendance
+
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEBeacon.h>
+
+#define IBEACON_UUID "1a7f44b2-e25c-44a8-a634-3d0b98065d21" 
+#define IBEACON_MAJOR 1
+#define IBEACON_MINOR_BASE 101
+
+// 🔄 Dynamic Minor Rotation Config
+#define ROTATION_INTERVAL 180000  // 3 minutes in milliseconds (Demo Mode)
+unsigned long lastRotation = 0;
+int currentMinor = IBEACON_MINOR_BASE;
+
+BLEAdvertising *pAdvertising;
+
+/**
+ * 🎯 Update Beacon Advertisement Data
+ * Called during setup and on each rotation
+ */
+void updateBeaconData(int minor) {
+  BLEBeacon beacon;
+  beacon.setManufacturerId(0x4C00); // Apple iBeacon
+  beacon.setProximityUUID(BLEUUID(IBEACON_UUID));
+  beacon.setMajor(IBEACON_MAJOR);
+  beacon.setMinor(minor);
+  beacon.setSignalPower(0xc5); // Calibrated TX power at 1m
+
+  BLEAdvertisementData advertisementData;
+  advertisementData.setFlags(0x06); // LE General Discoverable, BR/EDR Not Supported
+  advertisementData.setManufacturerData(beacon.getData());
+
+  pAdvertising->setAdvertisementData(advertisementData);
+}
+
+/**
+ * 🔄 Rotate Beacon Minor ID
+ * Creates a random dynamic ID to prevent replay attacks
+ */
+void rotateBeacon() {
+  unsigned long now = millis();
+  if (now - lastRotation >= ROTATION_INTERVAL) {
+    // 🎯 Generate a new random Minor ID for demo
+    currentMinor = 100 + random(0, 1000);
+    
+    // Update beacon with new minor
+    updateBeaconData(currentMinor);
+    
+    lastRotation = now;
+    Serial.print("🔄 Demo Rotation! New Minor: ");
+    Serial.println(currentMinor);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("🚀 Starting ESP32 Dynamic Beacon (Demo Mode)...");
+
+  // Seed random number generator for dynamic minor IDs
+  randomSeed(analogRead(0));
+
+  BLEDevice::init("ESP32_Beacon");
+
+  pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->setScanResponse(false);
+  pAdvertising->setAdvertisementType(ADV_TYPE_NONCONN_IND);
+
+  // Initialize beacon with base minor
+  updateBeaconData(currentMinor);
+
+  pAdvertising->start();
+  Serial.print("📡 Beacon broadcasting. Initial Minor: ");
+  Serial.println(currentMinor);
+}
+
+void loop() {
+  rotateBeacon();
+  delay(1000); // Check rotation every second
+}
