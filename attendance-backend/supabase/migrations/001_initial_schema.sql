@@ -70,12 +70,14 @@ CREATE TABLE IF NOT EXISTS sessions (
   actual_end TIMESTAMPTZ,
   session_date DATE DEFAULT CURRENT_DATE,
   stats JSONB DEFAULT '{"total": 0, "confirmed": 0, "provisional": 0}',
+  current_minor_id INTEGER,
+  last_rotation_at TIMESTAMPTZ DEFAULT now(),
+  rotation_interval_mins INTEGER DEFAULT 3,
   created_at TIMESTAMPTZ DEFAULT now()
 );
 
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_active_session_per_room 
-ON sessions(room_id) WHERE status = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_active_session_per_room ON sessions(room_id) WHERE status = 'active';
 
 -- 6. ATTENDANCE TABLE (Updated for New Flow)
 CREATE TABLE IF NOT EXISTS attendance (
