@@ -3,72 +3,71 @@ const { verifyDeviceSignature } = require('../utils/security');
 
 /**
  * 📥 1. Initial Check-In (Provisional)
- * Marks a student as present but unverified.
- * Now includes Dynamic Minor ID Validation ("Human Presence" Check)
+ * + Device Binding: locks device_id to student on first check-in
  */
 exports.checkIn = async (req, res) => {
   try {
     const { studentId, classId, sessionId, deviceId, deviceSignature, rssi, reportedMinor } = req.body;
 
-    // 1. Verify Device Signature (Security Gate)
+    // 1. Verify Device Signature
     const { valid } = verifyDeviceSignature({ deviceId, signature: deviceSignature });
     if (!valid) return res.status(401).json({ error: 'Invalid device signature' });
 
-    // 2. Get session with dynamic beacon info
+    // 2. Device Binding Check
+    const { data: student } = await supabaseAdmin
+      .from('students').select('device_id').eq('student_id', studentId).single();
+
+    if (student?.device_id && student.device_id !== deviceId) {
+      return res.status(403).json({
+        error: 'Device mismatch',
+        message: 'This account is bound to a different device. Contact your teacher to reset.'
+      });
+    }
+
+    // Bind device on first check-in
+    if (!student?.device_id) {
+      await supabaseAdmin.from('students').update({ device_id: deviceId }).eq('student_id', studentId);
+      console.log(`🔐 Device bound: ${studentId} → ${deviceId.substring(0, 8)}...`);
+    }
+
+    // 3. Get session
     const { data: session } = await supabaseAdmin
       .from('sessions')
       .select('status, current_minor_id, beacon_minor, last_rotation_at, rotation_interval_mins')
-      .eq('id', sessionId)
-      .single();
+      .eq('id', sessionId).single();
 
     if (!session || session.status !== 'active') {
       return res.status(403).json({ error: 'No active session found for this class' });
     }
 
-    // 3. 🎯 Dynamic ID Validation (The "Challenge" Gate)
-    // Accept if minor matches current_minor_id OR the original beacon_minor (fallback)
+    // 4. Minor ID Validation
     const expectedMinor = session.current_minor_id ?? session.beacon_minor;
     if (reportedMinor !== expectedMinor) {
-      return res.status(403).json({ 
-        error: 'Invalid Beacon ID', 
-        message: `Failed Human Presence Check (ID Mismatch: got ${reportedMinor}, expected ${expectedMinor})` 
-      });
+      return res.status(403).json({ error: 'Invalid Beacon ID', message: 'Minor mismatch' });
     }
 
-    // 4. 🕐 Rotation expiry check (skip if last_rotation_at is null — session just started)
+    // 5. Rotation expiry check
     if (session.last_rotation_at && session.rotation_interval_mins) {
-      const now = new Date();
-      const lastRotation = new Date(session.last_rotation_at);
-      const diffMinutes = (now - lastRotation) / 60000;
-
-      if (diffMinutes > session.rotation_interval_mins) {
-        return res.status(403).json({ 
-          error: 'Beacon Expired', 
-          message: `Please wait for the next beacon rotation (Window: ${session.rotation_interval_mins} min)` 
-        });
+      const diffMin = (new Date() - new Date(session.last_rotation_at)) / 60000;
+      if (diffMin > session.rotation_interval_mins) {
+        return res.status(403).json({ error: 'Beacon Expired', message: 'Wait for next rotation' });
       }
     }
 
-    // 5. Create provisional record
+    // 6. Create provisional record
     const { data: attendance, error } = await supabaseAdmin
       .from('attendance')
       .insert({
-        student_id: studentId,
-        class_id: classId,
-        session_id: sessionId,
-        device_id: deviceId,
-        status: 'provisional',
-        rssi: rssi || -70,
-        beacon_minor: reportedMinor, // Store the minor ID used for check-in
-        session_date: new Date().toISOString().split('T')[0]
+        student_id: studentId, class_id: classId, session_id: sessionId,
+        device_id: deviceId, status: 'provisional', rssi: rssi || -70,
+        beacon_minor: reportedMinor, session_date: new Date().toISOString().split('T')[0]
       })
-      .select()
-      .single();
+      .select().single();
 
     if (error && error.code === '23505') return res.status(200).json({ message: 'Already checked in' });
     if (error) throw error;
 
-    console.log(`✅ Check-in: Student ${studentId} with Minor ${reportedMinor}`);
+    console.log(`✅ Check-in: Student ${studentId} Minor ${reportedMinor}`);
     res.status(201).json({ success: true, status: 'provisional', attendance });
   } catch (error) {
     console.error('❌ Check-in error:', error);
@@ -118,27 +117,123 @@ exports.uploadRssiStream = async (req, res) => {
 
 /**
  * 🔒 3. Final Physical/Biometric Lock
- * Moves status to 'confirmed' after fingerprint or headcount.
  */
 exports.finalizeVerification = async (req, res) => {
   try {
     const { attendanceId, teacherId, verificationType } = req.body;
-
     const { data, error } = await supabaseAdmin
       .from('attendance')
       .update({
-        status: 'confirmed',
-        confirmed_at: new Date().toISOString(),
+        status: 'confirmed', confirmed_at: new Date().toISOString(),
         biometric_verified_at: verificationType === 'biometric' ? new Date().toISOString() : null,
         physical_verified_by: teacherId
       })
-      .eq('id', attendanceId)
-      .select()
-      .single();
-
+      .eq('id', attendanceId).select().single();
     if (error) throw error;
     res.status(200).json({ success: true, attendance: data });
   } catch (error) {
     res.status(500).json({ error: 'Final verification failed' });
+  }
+};
+
+/**
+ * 🔄 4. Step-2 Verification (2-Step Attendance)
+ * Student reports a NEW minor after beacon rotation → provisional → confirmed
+ */
+exports.verifyStep2 = async (req, res) => {
+  try {
+    const { studentId, sessionId, reportedMinor } = req.body;
+
+    // Get current session minor
+    const { data: session } = await supabaseAdmin
+      .from('sessions')
+      .select('current_minor_id, beacon_minor, status')
+      .eq('id', sessionId).maybeSingle();
+
+    if (!session || session.status !== 'active') {
+      return res.status(404).json({ error: 'Session ended' });
+    }
+
+    const expectedMinor = session.current_minor_id ?? session.beacon_minor;
+    if (reportedMinor !== expectedMinor) {
+      return res.status(403).json({ error: 'Minor mismatch', message: 'Step-2 failed' });
+    }
+
+    // Get the student's provisional attendance for this session
+    const { data: att } = await supabaseAdmin
+      .from('attendance')
+      .select('id, status, beacon_minor')
+      .eq('student_id', studentId).eq('session_id', sessionId).maybeSingle();
+
+    if (!att) return res.status(404).json({ error: 'No check-in found' });
+    if (att.status === 'confirmed') return res.status(200).json({ message: 'Already confirmed' });
+
+    // The reported minor must be DIFFERENT from the one used at check-in (proves continued presence)
+    if (reportedMinor === att.beacon_minor) {
+      return res.status(403).json({ error: 'Same minor as check-in', message: 'Wait for beacon rotation' });
+    }
+
+    // Confirm!
+    await supabaseAdmin.from('attendance').update({
+      status: 'confirmed', confirmed_at: new Date().toISOString()
+    }).eq('id', att.id);
+
+    console.log(`✅ Step-2 confirmed: ${studentId} (minor ${att.beacon_minor} → ${reportedMinor})`);
+    res.status(200).json({ success: true, status: 'confirmed' });
+  } catch (error) {
+    console.error('❌ Step-2 error:', error);
+    res.status(500).json({ error: 'Step-2 verification failed' });
+  }
+};
+
+/**
+ * 🔓 5. Reset Device Binding (Teacher only)
+ */
+exports.resetDevice = async (req, res) => {
+  try {
+    const { studentId } = req.body;
+    const { error } = await supabaseAdmin
+      .from('students').update({ device_id: null }).eq('student_id', studentId);
+    if (error) throw error;
+    console.log(`🔓 Device reset: ${studentId}`);
+    res.status(200).json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to reset device' });
+  }
+};
+
+/**
+ * 🔐 6. Biometric Fallback Confirmation
+ * Student self-confirms via fingerprint when step-2 times out
+ */
+exports.biometricConfirm = async (req, res) => {
+  try {
+    const { studentId, sessionId, deviceId } = req.body;
+
+    // Verify device still matches
+    const { data: student } = await supabaseAdmin
+      .from('students').select('device_id').eq('student_id', studentId).single();
+    if (student?.device_id && student.device_id !== deviceId) {
+      return res.status(403).json({ error: 'Device mismatch' });
+    }
+
+    const { data: att } = await supabaseAdmin
+      .from('attendance')
+      .select('id, status')
+      .eq('student_id', studentId).eq('session_id', sessionId).maybeSingle();
+
+    if (!att) return res.status(404).json({ error: 'No check-in found' });
+    if (att.status === 'confirmed') return res.status(200).json({ message: 'Already confirmed' });
+
+    await supabaseAdmin.from('attendance').update({
+      status: 'confirmed', confirmed_at: new Date().toISOString(),
+      biometric_verified_at: new Date().toISOString()
+    }).eq('id', att.id);
+
+    console.log(`🔐 Biometric confirmed: ${studentId}`);
+    res.status(200).json({ success: true, status: 'confirmed' });
+  } catch (error) {
+    console.error('❌ Biometric confirm error:', error);
+    res.status(500).json({ error: 'Biometric confirmation failed' });
   }
 };

@@ -382,6 +382,17 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
+    // Prevent starting a new session if one is already active
+    if (_activeSessionId != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("⚠️ A session is already active. End it before starting a new one."),
+          backgroundColor: Colors.orange,
+        ),
+      );
+      return;
+    }
+
     setState(() => _isStarting = true);
 
     final session = await _teacherService.startSession(
@@ -405,8 +416,8 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         );
 
-        // Navigate to live dashboard
-        Navigator.push(
+        // Navigate to live dashboard and handle result when it pops
+        final sessionEnded = await Navigator.push<bool>(
           context,
           MaterialPageRoute(
             builder: (context) => LiveDashboard(
@@ -415,6 +426,12 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ),
         );
+
+        // If session was ended from the dashboard, clear local state
+        if (sessionEnded == true && mounted) {
+          setState(() => _activeSessionId = null);
+          _loadTeacherData(); // Refresh class list
+        }
       }
     } else {
       if (mounted) {
@@ -428,9 +445,9 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  void _openLiveDashboard() {
+  void _openLiveDashboard() async {
     if (_activeSessionId != null) {
-      Navigator.push(
+      final sessionEnded = await Navigator.push<bool>(
         context,
         MaterialPageRoute(
           builder: (context) => LiveDashboard(
@@ -439,6 +456,11 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ),
       );
+
+      if (sessionEnded == true && mounted) {
+        setState(() => _activeSessionId = null);
+        _loadTeacherData();
+      }
     }
   }
 }

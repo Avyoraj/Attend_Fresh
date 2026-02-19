@@ -183,10 +183,10 @@ class _HomeScreenState extends State<HomeScreen> {
         onCheckInSuccess: () {
           setState(() {
             _statusTitle = "✅ Attendance Recorded";
-            _statusSubtitle = "Status: Provisional (Awaiting verification)";
+            _statusSubtitle = "Status: Provisional — verifying presence...";
             _statusIcon = Icons.check_circle;
             _statusColor = Colors.green;
-            _isScanning = false;
+            // Don't stop scanning — step-2 will run in background
           });
         },
         onCheckInError: (error) {
@@ -230,6 +230,47 @@ class _HomeScreenState extends State<HomeScreen> {
               _isScanning = false;
             });
           }
+        },
+        // ── Step-2 & Biometric callbacks ──
+        onStep2Waiting: () {
+          if (!mounted) return;
+          setState(() {
+            _statusTitle = "⏳ Verifying Presence...";
+            _statusSubtitle = "Stay in class — waiting for beacon rotation";
+            _statusIcon = Icons.hourglass_top;
+            _statusColor = Colors.amber;
+          });
+        },
+        onStep2Confirmed: () {
+          if (!mounted) return;
+          setState(() {
+            _statusTitle = "✅ Attendance Confirmed";
+            _statusSubtitle = "Step-2 verification passed!";
+            _statusIcon = Icons.verified;
+            _statusColor = Colors.green;
+            _isScanning = false;
+          });
+          _loadStudentData(); // refresh stats
+        },
+        onBiometricPrompt: () {
+          if (!mounted) return;
+          setState(() {
+            _statusTitle = "🔐 Fingerprint Required";
+            _statusSubtitle = "Step-2 timed out — verify with biometric";
+            _statusIcon = Icons.fingerprint;
+            _statusColor = Colors.deepPurple;
+          });
+        },
+        onBiometricConfirmed: () {
+          if (!mounted) return;
+          setState(() {
+            _statusTitle = "✅ Attendance Confirmed";
+            _statusSubtitle = "Biometric verification passed!";
+            _statusIcon = Icons.verified;
+            _statusColor = Colors.green;
+            _isScanning = false;
+          });
+          _loadStudentData(); // refresh stats
         },
       );
     } catch (e) {

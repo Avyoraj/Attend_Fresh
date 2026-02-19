@@ -1,12 +1,12 @@
 const express = require('express');
 const router = express.Router();
-const attendanceController = require('../controllers/attendance.controller');
+const c = require('../controllers/attendance.controller');
 
-// Student (Joiner) Endpoints
-router.post('/check-in', attendanceController.checkIn);
-router.post('/stream-rssi', attendanceController.uploadRssiStream);
-
-// Verification Endpoint (Final Lock)
-router.post('/finalize', attendanceController.finalizeVerification);
+router.post('/check-in', c.checkIn);
+router.post('/stream-rssi', c.uploadRssiStream);
+router.post('/finalize', c.finalizeVerification);
+router.post('/verify-step2', c.verifyStep2);
+router.post('/biometric-confirm', c.biometricConfirm);
+router.post('/reset-device', c.resetDevice);
 
 module.exports = router;

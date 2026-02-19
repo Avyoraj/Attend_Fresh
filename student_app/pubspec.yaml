@@ -45,6 +45,8 @@ dependencies:
   supabase_flutter: ^2.3.0
   # Runtime permission requests (BLE, Location)
   permission_handler: ^11.3.0
+  # Biometric authentication (fingerprint fallback)
+  local_auth: ^2.3.0
 
 
   # The following adds the Cupertino Icons font to your application.

@@ -5,6 +5,7 @@ import 'package:crypto/crypto.dart';
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter_beacon/flutter_beacon.dart';
 import 'package:http/http.dart' as http;
+import 'package:local_auth/local_auth.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
@@ -28,6 +29,11 @@ class AttendanceService {
   // Beacon ranging subscription (flutter_beacon)
   StreamSubscription<RangingResult>? _rangingSubscription;
   bool _isScanInProgress = false;
+
+  // Step-2 verification state
+  int? _checkInMinor; // Minor used at initial check-in
+  Timer? _step2Timer;
+  final LocalAuthentication _localAuth = LocalAuthentication();
 
   // Auth-driven student info
   String? _studentId;
@@ -106,6 +112,10 @@ class AttendanceService {
     Function()? onCheckInSuccess,
     Function(String error)? onCheckInError,
     Function()? onNoSession,
+    Function()? onStep2Waiting,
+    Function()? onStep2Confirmed,
+    Function()? onBiometricPrompt,
+    Function()? onBiometricConfirmed,
   }) async {
     try {
       // ── Explicitly request runtime permissions (Android 12+ needs BLUETOOTH_SCAN) ──
@@ -196,6 +206,10 @@ class AttendanceService {
                 onSuccess: onCheckInSuccess,
                 onError: onCheckInError,
                 onNoSession: onNoSession,
+                onStep2Waiting: onStep2Waiting,
+                onStep2Confirmed: onStep2Confirmed,
+                onBiometricPrompt: onBiometricPrompt,
+                onBiometricConfirmed: onBiometricConfirmed,
               );
               return;
             }
@@ -231,6 +245,10 @@ class AttendanceService {
     Function()? onSuccess,
     Function(String error)? onError,
     Function()? onNoSession,
+    Function()? onStep2Waiting,
+    Function()? onStep2Confirmed,
+    Function()? onBiometricPrompt,
+    Function()? onBiometricConfirmed,
   }) async {
     try {
       final deviceId = await _getDeviceId();
@@ -267,10 +285,19 @@ class AttendanceService {
       );
 
       if (response.statusCode == 201) {
+        _checkInMinor = minor; // Save for step-2 comparison
         onSuccess?.call();
         if (isNewPipeline) {
           _startRssiStreaming(minor);
         }
+        // Start step-2 verification (scan for rotated minor)
+        _startStep2Verification(
+          onWaiting: onStep2Waiting,
+          onConfirmed: onStep2Confirmed,
+          onBiometricPrompt: onBiometricPrompt,
+          onBiometricConfirmed: onBiometricConfirmed,
+          onError: onError,
+        );
       } else if (response.statusCode == 403) {
         final body = jsonDecode(response.body);
         if (body['error'] == 'No active session found for this class') {
@@ -287,6 +314,138 @@ class AttendanceService {
       }
     } catch (e) {
       onError?.call("Network error: ${e.toString()}");
+    }
+  }
+
+  /// Start Step-2 Verification: scan for rotated beacon minor
+  /// 5-minute timeout → falls back to biometric
+  void _startStep2Verification({
+    Function()? onWaiting,
+    Function()? onConfirmed,
+    Function()? onBiometricPrompt,
+    Function()? onBiometricConfirmed,
+    Function(String)? onError,
+  }) {
+    onWaiting?.call();
+    print('[AttendanceService] Step-2: waiting for beacon rotation...');
+
+    // 5-minute timeout → biometric fallback
+    _step2Timer = Timer(const Duration(minutes: 5), () {
+      _rangingSubscription?.cancel();
+      _rangingSubscription = null;
+      _attemptBiometricFallback(
+        onPrompt: onBiometricPrompt,
+        onConfirmed: onBiometricConfirmed,
+        onError: onError,
+      );
+    });
+
+    // Scan every 15s for a new minor
+    _pollForNewMinor(onConfirmed: onConfirmed, onError: onError);
+  }
+
+  /// Poll beacon for rotated minor and POST to verify-step2
+  Future<void> _pollForNewMinor({
+    Function()? onConfirmed,
+    Function(String)? onError,
+  }) async {
+    final regions = <Region>[
+      Region(identifier: 'AttendFreshStep2', proximityUUID: targetBeaconUUID),
+    ];
+
+    Future<void> doScan() async {
+      if (_step2Timer == null) return; // timer cancelled = step-2 done
+      await _rangingSubscription?.cancel();
+
+      bool found = false;
+      _rangingSubscription = flutterBeacon.ranging(regions).listen((result) async {
+        if (found) return;
+        for (final b in result.beacons) {
+          if (b.proximityUUID.toLowerCase() != targetBeaconUUID.toLowerCase()) continue;
+          if (b.minor != _checkInMinor) {
+            found = true;
+            await _rangingSubscription?.cancel();
+            _rangingSubscription = null;
+            _step2Timer?.cancel();
+            _step2Timer = null;
+
+            // POST verify-step2
+            try {
+              final studentId = await _getStudentId();
+              final resp = await http.post(
+                Uri.parse("$baseUrl/attendance/verify-step2"),
+                headers: {"Content-Type": "application/json"},
+                body: jsonEncode({
+                  "studentId": studentId,
+                  "sessionId": _currentSessionId,
+                  "reportedMinor": b.minor,
+                }),
+              );
+              if (resp.statusCode == 200) {
+                print('[AttendanceService] ✅ Step-2 confirmed (minor ${b.minor})');
+                onConfirmed?.call();
+              } else {
+                final body = jsonDecode(resp.body);
+                onError?.call(body['error'] ?? 'Step-2 failed');
+              }
+            } catch (e) {
+              onError?.call('Step-2 network error: $e');
+            }
+            return;
+          }
+        }
+      });
+
+      // Range for 5s then pause 10s before next attempt
+      await Future.delayed(const Duration(seconds: 5));
+      if (!found) {
+        await _rangingSubscription?.cancel();
+        _rangingSubscription = null;
+        await Future.delayed(const Duration(seconds: 10));
+        doScan(); // recurse
+      }
+    }
+
+    doScan();
+  }
+
+  /// Biometric fallback when step-2 times out
+  Future<void> _attemptBiometricFallback({
+    Function()? onPrompt,
+    Function()? onConfirmed,
+    Function(String)? onError,
+  }) async {
+    onPrompt?.call();
+    print('[AttendanceService] Step-2 timeout → biometric fallback');
+    try {
+      final didAuth = await _localAuth.authenticate(
+        localizedReason: 'Verify your identity to confirm attendance',
+        options: const AuthenticationOptions(biometricOnly: true),
+      );
+      if (!didAuth) {
+        onError?.call('Biometric verification cancelled');
+        return;
+      }
+      final studentId = await _getStudentId();
+      final deviceId = await _getDeviceId();
+      final resp = await http.post(
+        Uri.parse("$baseUrl/attendance/biometric-confirm"),
+        headers: {"Content-Type": "application/json"},
+        body: jsonEncode({
+          "studentId": studentId,
+          "sessionId": _currentSessionId,
+          "deviceId": deviceId,
+        }),
+      );
+      if (resp.statusCode == 200) {
+        print('[AttendanceService] 🔐 Biometric confirmed');
+        onConfirmed?.call();
+      } else {
+        final body = jsonDecode(resp.body);
+        onError?.call(body['error'] ?? 'Biometric confirm failed');
+      }
+    } catch (e) {
+      onError?.call('Biometric error: $e');
     }
   }
 
@@ -390,6 +549,8 @@ class AttendanceService {
   /// Cleanup
   void dispose() {
     stopRssiStreaming();
+    _step2Timer?.cancel();
+    _step2Timer = null;
     _rangingSubscription?.cancel();
     _rangingSubscription = null;
   }

@@ -62,10 +62,13 @@ exports.endSession = async (req, res) => {
         actual_end: new Date().toISOString()
       })
       .eq('id', sessionId)
+      .eq('status', 'active') // Only end active sessions (idempotent)
       .select()
-      .single();
+      .maybeSingle();
 
-    if (error || !session) {
+    if (error) throw error;
+
+    if (!session) {
       return res.status(404).json({ error: 'Session not found or already ended' });
     }
 
@@ -100,12 +103,12 @@ exports.updateSessionMinor = async (req, res) => {
       .eq('id', sessionId)
       .eq('status', 'active') // Only update active sessions
       .select()
-      .single();
+      .maybeSingle();
 
     if (error) throw error;
 
     if (!data) {
-      return res.status(404).json({ error: 'Active session not found' });
+      return res.status(404).json({ error: 'Active session not found (may have ended)' });
     }
 
     console.log(`🔄 DB Synced: Session ${sessionId} now expects Minor ${newMinorId}`);

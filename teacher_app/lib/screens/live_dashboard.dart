@@ -437,11 +437,20 @@ class _LiveDashboardState extends State<LiveDashboard> {
   }
 
   Future<void> _endSession() async {
+    // 1. Stop beacon monitor FIRST so it doesn't sync to an ended session
+    _beaconMonitor.stopMonitoring();
+
+    // 2. Stop polling
+    _pollTimer?.cancel();
+    _pollTimer = null;
+
+    // 3. End session on backend
     final success = await _teacherService.endSession(widget.sessionId);
     
     if (mounted) {
       if (success) {
-        Navigator.pop(context);
+        // Pop with result=true so home_screen knows to clear _activeSessionId
+        Navigator.pop(context, true);
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text("✅ Session ended successfully"),
@@ -449,6 +458,9 @@ class _LiveDashboardState extends State<LiveDashboard> {
           ),
         );
       } else {
+        // Restart monitoring if end failed
+        _startBeaconMonitoring();
+        _startPolling();
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text("❌ Failed to end session"),
