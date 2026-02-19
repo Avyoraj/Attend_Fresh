@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 import '../services/teacher_service.dart';
+import '../services/teacher_auth_service.dart';
 import 'live_dashboard.dart';
+import 'teacher_auth_screen.dart';
 
 /// 🏠 Teacher Home Screen
 /// Start sessions, view classes, manage attendance
@@ -13,16 +16,77 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   final TeacherService _teacherService = TeacherService();
+  final TeacherAuthService _authService = TeacherAuthService();
+  final SupabaseClient _supabase = Supabase.instance.client;
   
   bool _isStarting = false;
   String? _activeSessionId;
 
-  // Mock data - replace with actual data from Supabase
-  final List<Map<String, String>> _todayClasses = [
-    {'id': 'CS101', 'name': 'Data Structures', 'time': '9:00 AM', 'room': 'Room 101'},
-    {'id': 'CS201', 'name': 'Algorithms', 'time': '11:00 AM', 'room': 'Room 203'},
-    {'id': 'CS301', 'name': 'Database Systems', 'time': '2:00 PM', 'room': 'Room 105'},
-  ];
+  // Teacher profile
+  String _teacherName = '';
+  String? _teacherId;  // UUID from teachers table
+
+  // Real classes from Supabase
+  List<Map<String, String>> _todayClasses = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadTeacherData();
+  }
+
+  Future<void> _loadTeacherData() async {
+    try {
+      final profile = await _authService.getTeacherProfile();
+      if (profile != null) {
+        _teacherName = profile['name'] ?? '';
+        _teacherId = profile['id'];
+
+        // Fetch classes taught by this teacher
+        final classes = await _supabase
+            .from('classes')
+            .select('class_id, name, room_id')
+            .eq('teacher_id', _teacherId!)
+            .eq('is_active', true);
+
+        _todayClasses = (classes as List).map<Map<String, String>>((c) {
+          return {
+            'id': c['class_id'] as String? ?? '',
+            'name': c['name'] as String? ?? '',
+            'room': c['room_id'] as String? ?? '',
+            'time': '',
+          };
+        }).toList();
+
+        // If no classes assigned, show a default list for demo
+        if (_todayClasses.isEmpty) {
+          _todayClasses = [
+            {'id': 'CS101', 'name': 'Data Structures', 'time': '9:00 AM', 'room': 'ROOM_01'},
+            {'id': 'CS201', 'name': 'Algorithms', 'time': '11:00 AM', 'room': 'ROOM_01'},
+            {'id': 'CS301', 'name': 'Database Systems', 'time': '2:00 PM', 'room': 'ROOM_01'},
+          ];
+        }
+      } else {
+        final user = _supabase.auth.currentUser;
+        _teacherName = user?.email?.split('@').first ?? 'Teacher';
+      }
+
+      // Check for any active session
+      final activeSessions = await _supabase
+          .from('sessions')
+          .select('id')
+          .eq('status', 'active')
+          .limit(1);
+      
+      if ((activeSessions as List).isNotEmpty) {
+        _activeSessionId = activeSessions[0]['id'];
+      }
+
+      if (mounted) setState(() {});
+    } catch (e) {
+      debugPrint('Error loading teacher data: $e');
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -39,8 +103,20 @@ class _HomeScreenState extends State<HomeScreen> {
         elevation: 0,
         actions: [
           IconButton(
-            icon: Icon(Icons.notifications_outlined, color: Colors.indigo[900]),
-            onPressed: () {},
+            icon: Icon(Icons.refresh, color: Colors.indigo[900]),
+            onPressed: _loadTeacherData,
+          ),
+          IconButton(
+            icon: Icon(Icons.logout, color: Colors.indigo[900]),
+            onPressed: () async {
+              await _authService.signOut();
+              if (mounted) {
+                Navigator.of(context).pushAndRemoveUntil(
+                  MaterialPageRoute(builder: (_) => const TeacherAuthScreen()),
+                  (route) => false,
+                );
+              }
+            },
           ),
         ],
       ),
@@ -113,9 +189,9 @@ class _HomeScreenState extends State<HomeScreen> {
                   "Welcome back,",
                   style: TextStyle(color: Colors.white70, fontSize: 14),
                 ),
-                const Text(
-                  "Professor Harsh",
-                  style: TextStyle(
+                Text(
+                  _teacherName.isNotEmpty ? _teacherName : "Teacher",
+                  style: const TextStyle(
                     color: Colors.white,
                     fontSize: 22,
                     fontWeight: FontWeight.bold,
@@ -263,7 +339,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ),
           ElevatedButton(
-            onPressed: () => _startSessionForClass(classInfo),
+            onPressed: _isStarting ? null : () => _startSessionForClass(classInfo),
             style: ElevatedButton.styleFrom(
               backgroundColor: Colors.indigo,
               foregroundColor: Colors.white,
@@ -271,7 +347,11 @@ class _HomeScreenState extends State<HomeScreen> {
                 borderRadius: BorderRadius.circular(8),
               ),
             ),
-            child: const Text("Start"),
+            child: _isStarting
+                ? const SizedBox(
+                    height: 18, width: 18,
+                    child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                : const Text("Start"),
           ),
         ],
       ),
@@ -295,14 +375,21 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _startSessionForClass(Map<String, String> classInfo) async {
+    if (_teacherId == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("❌ Teacher profile not loaded"), backgroundColor: Colors.red),
+      );
+      return;
+    }
+
     setState(() => _isStarting = true);
 
     final session = await _teacherService.startSession(
       classId: classInfo['id']!,
       className: classInfo['name']!,
-      roomId: 'ROOM_01',
-      teacherId: 'TEACHER_UUID_01',
-      teacherName: 'Professor Harsh',
+      roomId: classInfo['room'] ?? 'ROOM_01',
+      teacherId: _teacherId!,
+      teacherName: _teacherName,
     );
 
     setState(() => _isStarting = false);

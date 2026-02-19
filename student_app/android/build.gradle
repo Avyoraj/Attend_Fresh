@@ -13,6 +13,24 @@ subprojects {
     project.evaluationDependsOn(":app")
 }
 
+// Some plugins (e.g. app_links) reference `flutter.compileSdkVersion` inside
+// their android block. The `flutter` extension only exists in :app, so we
+// create a lightweight stand-in for every other subproject.
+subprojects { sub ->
+    if (sub.name != "app") {
+        sub.extensions.create("flutter", FlutterCompat)
+    }
+}
+
+class FlutterCompat {
+    int compileSdkVersion = 34
+    int minSdkVersion     = 23
+    int targetSdkVersion  = 34
+    String ndkVersion     = "25.1.8937393"
+    int versionCode       = 1
+    String versionName    = "1.0.0"
+}
+
 tasks.register("clean", Delete) {
     delete rootProject.buildDir
 }

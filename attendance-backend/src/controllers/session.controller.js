@@ -21,8 +21,11 @@ exports.startSession = async (req, res) => {
         class_name: className,
         teacher_id: teacherId,
         teacher_name: teacherName,
-        beacon_major: beaconMajor,
-        beacon_minor: beaconMinor,
+        beacon_major: beaconMajor || 1,
+        beacon_minor: beaconMinor || 101,
+        current_minor_id: beaconMinor || 101, // ← Initialize so student check-in works immediately
+        last_rotation_at: new Date().toISOString(),
+        rotation_interval_mins: 60, // Default to full class period; tightens when ESP32 rotates
         status: 'active',
         actual_start: new Date().toISOString()
       })
@@ -91,7 +94,8 @@ exports.updateSessionMinor = async (req, res) => {
       .from('sessions')
       .update({
         current_minor_id: newMinorId,
-        last_rotation_at: new Date().toISOString()
+        last_rotation_at: new Date().toISOString(),
+        rotation_interval_mins: 3 // Tighten window once ESP32 rotation is active
       })
       .eq('id', sessionId)
       .eq('status', 'active') // Only update active sessions
@@ -109,5 +113,44 @@ exports.updateSessionMinor = async (req, res) => {
   } catch (error) {
     console.error('❌ Sync minor error:', error);
     res.status(500).json({ error: 'Failed to sync Minor ID' });
+  }
+};
+
+/**
+ * 🔍 Discover Active Session by Beacon Minor
+ * Called by the Student App after it detects a beacon.
+ * Finds the active session whose current_minor_id matches.
+ */
+exports.discoverSession = async (req, res) => {
+  try {
+    const minor = parseInt(req.query.minor, 10);
+    if (isNaN(minor)) {
+      return res.status(400).json({ error: 'Missing or invalid minor parameter' });
+    }
+
+    // Look for an active session that matches this minor
+    // Check both current_minor_id (rotated) and beacon_minor (original)
+    const { data: session, error } = await supabaseAdmin
+      .from('sessions')
+      .select('id, class_id, class_name, beacon_minor, current_minor_id')
+      .eq('status', 'active')
+      .or(`current_minor_id.eq.${minor},beacon_minor.eq.${minor}`)
+      .maybeSingle();
+
+    if (error) throw error;
+
+    if (!session) {
+      return res.status(404).json({ error: 'No active session found for this beacon' });
+    }
+
+    console.log(`🔍 Session discovered: ${session.class_name} (minor=${minor})`);
+    res.status(200).json({
+      sessionId: session.id,
+      classId: session.class_id,
+      className: session.class_name,
+    });
+  } catch (error) {
+    console.error('❌ Discover session error:', error);
+    res.status(500).json({ error: 'Failed to discover session' });
   }
 };

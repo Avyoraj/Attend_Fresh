@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 import '../widgets/status_card.dart';
 import '../services/attendance_service.dart';
 
@@ -13,28 +15,156 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   final AttendanceService _attendanceService = AttendanceService();
+  final SupabaseClient _supabase = Supabase.instance.client;
   
   // UI State
   bool _isScanning = false;
+  int _scanRetryCount = 0;
+  static const int _maxScanRetries = 5;
+  Timer? _retryTimer;
   String _statusTitle = "No Attendance Yet";
   String _statusSubtitle = "Move near a beacon to check in";
   IconData _statusIcon = Icons.access_time_filled;
   Color _statusColor = Colors.grey;
 
-  // Weekly stats (mock data for now)
-  final int _attendedClasses = 12;
-  final int _totalClasses = 15;
+  // Real stats
+  int _attendedClasses = 0;
+  int _totalClasses = 0;
+  String _studentName = '';
+  String _studentId = '';
+  List<Map<String, dynamic>> _todayClasses = [];
 
   @override
   void initState() {
     super.initState();
-    _startScanning();
+    _loadStudentData();
+    // Auto-scan after short delay so the UI renders first
+    Future.delayed(const Duration(seconds: 3), () {
+      if (mounted && !_isScanning) {
+        _startScanning();
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _retryTimer?.cancel();
+    _attendanceService.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadStudentData() async {
+    final user = _supabase.auth.currentUser;
+    if (user == null) return;
+
+    try {
+      // Get student profile
+      final profile = await _supabase
+          .from('students')
+          .select()
+          .eq('email', user.email!)
+          .maybeSingle();
+
+      if (profile != null) {
+        _studentName = profile['name'] ?? 'Student';
+        _studentId = profile['student_id'] ?? '';
+      } else {
+        _studentName = user.email?.split('@').first ?? 'Student';
+      }
+
+      // Get weekly attendance stats (this week)
+      final now = DateTime.now();
+      final weekStart = now.subtract(Duration(days: now.weekday - 1));
+      final weekStartStr = weekStart.toIso8601String().split('T')[0];
+
+      // Total sessions this week (across all classes)
+      final sessionsThisWeek = await _supabase
+          .from('sessions')
+          .select('id')
+          .gte('session_date', weekStartStr)
+          .eq('status', 'ended');
+
+      _totalClasses = (sessionsThisWeek as List).length;
+
+      // Attended this week
+      if (_studentId.isNotEmpty) {
+        final attendedThisWeek = await _supabase
+            .from('attendance')
+            .select('id')
+            .eq('student_id', _studentId)
+            .gte('session_date', weekStartStr)
+            .inFilter('status', ['confirmed', 'provisional']);
+
+        _attendedClasses = (attendedThisWeek as List).length;
+
+        // Today's classes with attendance status
+        final todayStr = now.toIso8601String().split('T')[0];
+        final todaySessions = await _supabase
+            .from('sessions')
+            .select('id, class_id, class_name, room_id, actual_start, status')
+            .eq('session_date', todayStr)
+            .order('actual_start', ascending: true);
+
+        final todayAttendance = await _supabase
+            .from('attendance')
+            .select('session_id, status')
+            .eq('student_id', _studentId)
+            .eq('session_date', todayStr);
+
+        final attendanceMap = <String, String>{};
+        for (final a in todayAttendance as List) {
+          attendanceMap[a['session_id']] = a['status'];
+        }
+
+        _todayClasses = (todaySessions as List).map((s) {
+          final sessionId = s['id'] as String;
+          final attStatus = attendanceMap[sessionId];
+          return {
+            'name': s['class_name'] ?? s['class_id'] ?? 'Unknown',
+            'time': _formatTime(s['actual_start']),
+            'room': s['room_id'] ?? '',
+            'attended': attStatus == 'confirmed' || attStatus == 'provisional',
+            'status': attStatus,
+          };
+        }).toList();
+      }
+
+      // Also count active sessions (include them in total if no ended ones yet)
+      final activeSessions = await _supabase
+          .from('sessions')
+          .select('id')
+          .gte('session_date', weekStartStr)
+          .eq('status', 'active');
+      
+      _totalClasses += (activeSessions as List).length;
+
+      if (mounted) setState(() {});
+    } catch (e) {
+      debugPrint('Error loading student data: $e');
+    }
+  }
+
+  String _formatTime(String? isoTime) {
+    if (isoTime == null) return '';
+    try {
+      final dt = DateTime.parse(isoTime).toLocal();
+      final hour = dt.hour > 12 ? dt.hour - 12 : (dt.hour == 0 ? 12 : dt.hour);
+      final amPm = dt.hour >= 12 ? 'PM' : 'AM';
+      return '${hour.toString()}:${dt.minute.toString().padLeft(2, '0')} $amPm';
+    } catch (_) {
+      return '';
+    }
   }
 
   Future<void> _startScanning() async {
+    if (_scanRetryCount == 0) {
+      // Only reset UI for first scan, not retries
+    }
     setState(() {
       _isScanning = true;
-      _statusTitle = "🔍 Searching for classroom beacon...";
+      _statusTitle = _scanRetryCount > 0
+          ? "🔍 Retry scan $_scanRetryCount/$_maxScanRetries..."
+          : "🔍 Searching for classroom beacon...";
       _statusSubtitle = "Move closer to the classroom.";
       _statusIcon = Icons.track_changes;
       _statusColor = Colors.orange;
@@ -60,22 +190,46 @@ class _HomeScreenState extends State<HomeScreen> {
           });
         },
         onCheckInError: (error) {
+          // Show a short user-friendly message, not the raw exception
+          String cleanError = error;
+          if (error.contains('PlatformException') || error.contains('SecurityException')) {
+            cleanError = "Bluetooth permission denied. Please grant Bluetooth & Location permissions in Settings.";
+          } else if (error.length > 120) {
+            cleanError = error.substring(0, 120);
+          }
           setState(() {
             _statusTitle = "❌ Check-in Failed";
-            _statusSubtitle = error;
+            _statusSubtitle = cleanError;
             _statusIcon = Icons.error;
             _statusColor = Colors.red;
             _isScanning = false;
           });
         },
         onNoSession: () {
-          setState(() {
-            _statusTitle = "No active class session";
-            _statusSubtitle = "Wait for your teacher to start the session.";
-            _statusIcon = Icons.event_busy;
-            _statusColor = Colors.grey;
-            _isScanning = false;
-          });
+          if (_scanRetryCount < _maxScanRetries && mounted) {
+            _scanRetryCount++;
+            setState(() {
+              _statusTitle = "No beacon found — retrying ($_scanRetryCount/$_maxScanRetries)";
+              _statusSubtitle = "Scanning again in 10 seconds...";
+              _statusIcon = Icons.refresh;
+              _statusColor = Colors.orange;
+              _isScanning = false;
+            });
+            _retryTimer?.cancel();
+            _retryTimer = Timer(const Duration(seconds: 10), () {
+              if (mounted && !_isScanning) {
+                _startScanning();
+              }
+            });
+          } else {
+            setState(() {
+              _statusTitle = "No active class session";
+              _statusSubtitle = "Tap the refresh button to scan again.";
+              _statusIcon = Icons.event_busy;
+              _statusColor = Colors.grey;
+              _isScanning = false;
+            });
+          }
         },
       );
     } catch (e) {
@@ -94,7 +248,7 @@ class _HomeScreenState extends State<HomeScreen> {
     return Scaffold(
       appBar: AppBar(
         title: Text(
-          "Welcome, 0080",
+          "Welcome, ${_studentName.isNotEmpty ? _studentName : 'Student'}",
           style: TextStyle(
             color: Colors.blue[900],
             fontWeight: FontWeight.bold,
@@ -108,7 +262,12 @@ class _HomeScreenState extends State<HomeScreen> {
               _isScanning ? Icons.stop : Icons.refresh,
               color: Colors.blue[900],
             ),
-            onPressed: _isScanning ? null : _startScanning,
+            onPressed: _isScanning ? null : () {
+              _scanRetryCount = 0; // Reset retry counter on manual refresh
+              _retryTimer?.cancel();
+              _loadStudentData();
+              _startScanning();
+            },
           ),
         ],
       ),
@@ -153,11 +312,30 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
             const SizedBox(height: 12),
-            _buildClassCard("CS101 - Data Structures", "9:00 AM", "Room 101", true),
-            const SizedBox(height: 8),
-            _buildClassCard("CS201 - Algorithms", "11:00 AM", "Room 203", false),
-            const SizedBox(height: 8),
-            _buildClassCard("CS301 - Database Systems", "2:00 PM", "Room 105", false),
+            if (_todayClasses.isEmpty)
+              Container(
+                padding: const EdgeInsets.all(20),
+                decoration: BoxDecoration(
+                  color: Colors.grey[100],
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Center(
+                  child: Text(
+                    'No classes scheduled for today',
+                    style: TextStyle(color: Colors.grey[600], fontSize: 15),
+                  ),
+                ),
+              )
+            else
+              ..._todayClasses.map((cls) => Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: _buildClassCard(
+                  cls['name'] as String,
+                  cls['time'] as String,
+                  cls['room'] as String,
+                  cls['attended'] as bool,
+                ),
+              )),
           ],
         ),
       ),
@@ -165,7 +343,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildProgressCard() {
-    double progress = _attendedClasses / _totalClasses;
+    double progress = _totalClasses > 0 ? _attendedClasses / _totalClasses : 0;
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(

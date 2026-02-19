@@ -30,8 +30,8 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  # For BLE Scanning
-  flutter_blue_plus: 1.15.0
+  # For iBeacon Ranging (native OS-level API — works on Xiaomi/MIUI)
+  flutter_beacon: ^0.5.1
   # For HTTP requests to your Backend
   http: ^1.1.0
   # For Device ID and Security (HMAC)
@@ -41,6 +41,10 @@ dependencies:
   flutter_dotenv: ^5.1.0
   # For persistent settings storage
   shared_preferences: ^2.2.2
+  # Supabase for Auth and Database
+  supabase_flutter: ^2.3.0
+  # Runtime permission requests (BLE, Location)
+  permission_handler: ^11.3.0
 
 
   # The following adds the Cupertino Icons font to your application.

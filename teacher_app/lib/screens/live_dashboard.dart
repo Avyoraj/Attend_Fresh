@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import '../services/teacher_service.dart';
 import '../services/beacon_monitor.dart';
@@ -27,27 +28,39 @@ class _LiveDashboardState extends State<LiveDashboard> {
   Map<String, int> _stats = {'total': 0, 'confirmed': 0, 'provisional': 0, 'flagged': 0};
   int? _currentMinor;
   bool _isBeaconSyncing = false;
+  Timer? _pollTimer;
 
   @override
   void initState() {
     super.initState();
-    _setupRealtimeSubscription();
+    _startPolling();
     _startBeaconMonitoring();
     _loadStats();
   }
 
   @override
   void dispose() {
+    _pollTimer?.cancel();
     _beaconMonitor.dispose();
     super.dispose();
   }
 
-  /// 📡 Setup Supabase Realtime Subscription
-  void _setupRealtimeSubscription() {
-    _teacherService.subscribeToAttendance(widget.sessionId).listen((data) {
+  /// Poll attendance every 5 seconds (replaces Realtime to avoid timeout)
+  void _startPolling() {
+    // Initial fetch
+    _fetchAttendance();
+    // Poll every 5 seconds
+    _pollTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      _fetchAttendance();
+    });
+  }
+
+  Future<void> _fetchAttendance() async {
+    final data = await _teacherService.fetchAttendance(widget.sessionId);
+    if (mounted) {
       setState(() => _liveAttendees = data);
       _loadStats();
-    });
+    }
   }
 
   /// 🔄 Start Beacon Monitoring for Rotation Detection

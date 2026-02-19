@@ -107,14 +107,19 @@ class TeacherService {
     }
   }
 
-  /// 📡 Subscribe to Live Attendance (Supabase Realtime)
-  /// Returns a stream of attendance records for the session
-  Stream<List<Map<String, dynamic>>> subscribeToAttendance(String sessionId) {
-    return supabase
-        .from('attendance')
-        .stream(primaryKey: ['id'])
-        .eq('session_id', sessionId)
-        .order('check_in_time', ascending: false);
+  /// Fetch attendance records for a session (polling-based, no Realtime needed)
+  Future<List<Map<String, dynamic>>> fetchAttendance(String sessionId) async {
+    try {
+      final response = await supabase
+          .from('attendance')
+          .select('*')
+          .eq('session_id', sessionId)
+          .order('check_in_time', ascending: false);
+      return List<Map<String, dynamic>>.from(response);
+    } catch (e) {
+      print('[TeacherService] fetchAttendance error: $e');
+      return [];
+    }
   }
 
   /// 📊 Get Session Statistics
@@ -164,7 +169,7 @@ class TeacherService {
   Future<bool> markAsAbsent(String attendanceId, String reason) async {
     try {
       await supabase.from('attendance').update({
-        'status': 'cancelled',
+        'status': 'absent',
         'cancelled_at': DateTime.now().toIso8601String(),
         'cancellation_reason': reason,
       }).eq('id', attendanceId);

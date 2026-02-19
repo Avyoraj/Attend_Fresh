@@ -1,26 +1,56 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show Platform;
 import 'package:crypto/crypto.dart';
 import 'package:device_info_plus/device_info_plus.dart';
-import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:flutter_beacon/flutter_beacon.dart';
 import 'package:http/http.dart' as http;
+import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
 class AttendanceService {
-  // Configuration — pass via: flutter run --dart-define=BACKEND_IP=x.x.x.x
-  static const _backendIp = String.fromEnvironment('BACKEND_IP', defaultValue: '192.168.1.117');
+  // Configuration
+  static const _backendIp =
+      String.fromEnvironment('BACKEND_IP', defaultValue: '192.168.1.117');
   final String baseUrl = "http://$_backendIp:5000/api";
-  final String salt = "my_secret_salt"; // Must match backend .env DEVICE_SALT_SECRET
+  final String salt = "my_secret_salt";
+  // ESP32 broadcasts UUID in reversed byte order (hardware quirk)
   final String targetBeaconUUID = "215d0698-0b3d-34a6-a844-5ce2b2447f1a";
-  
+
   // State
   Timer? _rssiStreamTimer;
   bool _isStreaming = false;
   String? _currentSessionId;
+  String? _currentClassId;
   String? _deviceId;
 
-  /// 🛡️ Generate HMAC-SHA256 Signature
-  /// Matches the logic in your backend security.js
+  // Beacon ranging subscription (flutter_beacon)
+  StreamSubscription<RangingResult>? _rangingSubscription;
+  bool _isScanInProgress = false;
+
+  // Auth-driven student info
+  String? _studentId;
+
+  /// Load student_id from Supabase based on current auth user
+  Future<String?> _getStudentId() async {
+    if (_studentId != null) return _studentId;
+    try {
+      final user = Supabase.instance.client.auth.currentUser;
+      if (user == null) return null;
+      final profile = await Supabase.instance.client
+          .from('students')
+          .select('student_id')
+          .eq('email', user.email!)
+          .maybeSingle();
+      if (profile != null) {
+        _studentId = profile['student_id'] as String;
+      }
+    } catch (_) {}
+    return _studentId;
+  }
+
+  /// Generate HMAC-SHA256 Signature
   String _generateSignature(String deviceId) {
     var key = utf8.encode(salt);
     var bytes = utf8.encode(deviceId);
@@ -28,28 +58,49 @@ class AttendanceService {
     return hmacSha256.convert(bytes).toString();
   }
 
-  /// � Get Device ID
+  /// Get Device ID
   Future<String> _getDeviceId() async {
     if (_deviceId != null) return _deviceId!;
-    
     DeviceInfoPlugin deviceInfo = DeviceInfoPlugin();
     try {
       AndroidDeviceInfo androidInfo = await deviceInfo.androidInfo;
       _deviceId = androidInfo.id;
     } catch (e) {
-      // Fallback for iOS or other platforms
       _deviceId = "DEVICE_${DateTime.now().millisecondsSinceEpoch}";
     }
     return _deviceId!;
   }
 
-  /// 🔧 Check if New Pipeline is Enabled
+  /// Check if New Pipeline is Enabled
   Future<bool> _isNewPipelineEnabled() async {
     final prefs = await SharedPreferences.getInstance();
     return prefs.getBool('new_pipeline_enabled') ?? false;
   }
 
-  /// 📡 Start Frictionless Check-In with Callbacks
+  /// Discover Active Session from backend by beacon minor
+  Future<Map<String, String>?> _discoverSession(int minor) async {
+    try {
+      final response = await http.get(
+        Uri.parse("$baseUrl/sessions/discover?minor=$minor"),
+        headers: {"Content-Type": "application/json"},
+      );
+      if (response.statusCode == 200) {
+        final body = jsonDecode(response.body);
+        return {
+          'sessionId': body['sessionId'] as String,
+          'classId': body['classId'] as String,
+          'className': body['className'] as String? ?? '',
+        };
+      }
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Start Frictionless Check-In using native iBeacon ranging API
+  /// Uses flutter_beacon which leverages Android Beacon Library under the hood
+  /// This works on Xiaomi/MIUI devices where raw BLE scanning filters out iBeacons
   Future<void> startFrictionlessCheckIn({
     Function(int minor, int rssi)? onBeaconFound,
     Function()? onCheckInSuccess,
@@ -57,33 +108,87 @@ class AttendanceService {
     Function()? onNoSession,
   }) async {
     try {
-      // Check Bluetooth status
-      if (await FlutterBluePlus.isAvailable == false) {
-        onCheckInError?.call("Bluetooth not supported or not available on this device");
+      // ── Explicitly request runtime permissions (Android 12+ needs BLUETOOTH_SCAN) ──
+      if (Platform.isAndroid) {
+        final statuses = await [
+          Permission.bluetoothScan,
+          Permission.bluetoothConnect,
+          Permission.locationWhenInUse,
+        ].request();
+
+        print('[AttendanceService] Permission statuses: $statuses');
+
+        if (statuses[Permission.bluetoothScan]?.isDenied == true ||
+            statuses[Permission.bluetoothScan]?.isPermanentlyDenied == true) {
+          onCheckInError?.call(
+              'Bluetooth Scan permission is required. Please grant it in Settings.');
+          return;
+        }
+        if (statuses[Permission.locationWhenInUse]?.isDenied == true ||
+            statuses[Permission.locationWhenInUse]?.isPermanentlyDenied == true) {
+          onCheckInError?.call(
+              'Location permission is required for beacon detection. Please enable it in Settings.');
+          return;
+        }
+      }
+
+      // Initialize beacon scanning (after permissions are granted)
+      try {
+        await flutterBeacon.initializeAndCheckScanning;
+        print('[AttendanceService] Beacon scanning initialized');
+      } catch (e) {
+        print('[AttendanceService] Beacon init error: $e');
+        onCheckInError?.call(
+            "Bluetooth & Location must be enabled for attendance check-in. "
+            "Please enable them in Settings. Error: $e");
         return;
       }
 
-      // Start scanning
-      FlutterBluePlus.scanResults.listen((results) async {
-        for (ScanResult r in results) {
-          // Look for iBeacon with our UUID in manufacturer data
-          final manufacturerData = r.advertisementData.manufacturerData;
-          
-          if (manufacturerData.isNotEmpty) {
-            // Parse iBeacon data (Apple Company ID: 0x004C)
-            final beaconData = _parseIBeacon(manufacturerData);
-            
-            if (beaconData != null && 
-                beaconData['uuid']?.toLowerCase() == targetBeaconUUID.toLowerCase()) {
-              
-              final minor = beaconData['minor'] as int;
-              final rssi = r.rssi;
-              
+      // Cancel any previous ranging
+      await _rangingSubscription?.cancel();
+      _rangingSubscription = null;
+
+      // Define region to scan — use UUID filter for targeted detection
+      final regions = <Region>[
+        Region(
+          identifier: 'AttendFresh',
+          proximityUUID: targetBeaconUUID,
+        ),
+      ];
+
+      print('[AttendanceService] Starting iBeacon ranging for UUID: $targetBeaconUUID');
+
+      bool beaconHandled = false;
+      int scanDurationSeconds = 10;
+
+      // Start native iBeacon ranging
+      _rangingSubscription = flutterBeacon.ranging(regions).listen(
+        (RangingResult result) async {
+          if (beaconHandled) return;
+
+          final beacons = result.beacons;
+          print('[AttendanceService] Ranging result: ${beacons.length} beacon(s) found');
+
+          for (final beacon in beacons) {
+            print('[AttendanceService] Beacon: uuid=${beacon.proximityUUID} '
+                'major=${beacon.major} minor=${beacon.minor} '
+                'rssi=${beacon.rssi} accuracy=${beacon.accuracy}m '
+                'proximity=${beacon.proximity}');
+
+            // Match our target UUID
+            if (beacon.proximityUUID.toLowerCase() == targetBeaconUUID.toLowerCase()) {
+              final minor = beacon.minor;
+              final rssi = beacon.rssi;
+
+              print('[AttendanceService] *** TARGET BEACON FOUND *** Minor: $minor RSSI: $rssi');
+
+              beaconHandled = true;
               onBeaconFound?.call(minor, rssi);
-              
-              // Stop scanning once beacon found
-              await FlutterBluePlus.stopScan();
-              
+
+              // Stop ranging once beacon found
+              await _rangingSubscription?.cancel();
+              _rangingSubscription = null;
+
               // Attempt check-in
               await _performCheckIn(
                 minor: minor,
@@ -92,30 +197,34 @@ class AttendanceService {
                 onError: onCheckInError,
                 onNoSession: onNoSession,
               );
-              
               return;
             }
           }
-        }
-      });
-
-      // Start the scan
-      await FlutterBluePlus.startScan(
-        timeout: const Duration(seconds: 10),
+        },
+        onError: (error) {
+          print('[AttendanceService] Ranging error: $error');
+        },
       );
 
-      // If scan completes without finding beacon
-      await Future.delayed(const Duration(seconds: 11));
-      if (!_isStreaming) {
-        onNoSession?.call();
-      }
+      // Wait for scan duration then clean up if nothing found
+      await Future.delayed(Duration(seconds: scanDurationSeconds));
 
+      if (!beaconHandled) {
+        print('[AttendanceService] Ranging complete — no target beacon found');
+        await _rangingSubscription?.cancel();
+        _rangingSubscription = null;
+        if (!_isStreaming) {
+          onNoSession?.call();
+        }
+      }
     } catch (e) {
+      await _rangingSubscription?.cancel();
+      _rangingSubscription = null;
       onCheckInError?.call("Bluetooth error: ${e.toString()}");
     }
   }
 
-  /// 📥 Perform Check-In to Backend
+  /// Perform Check-In to Backend
   Future<void> _performCheckIn({
     required int minor,
     required int rssi,
@@ -127,14 +236,29 @@ class AttendanceService {
       final deviceId = await _getDeviceId();
       final signature = _generateSignature(deviceId);
       final isNewPipeline = await _isNewPipelineEnabled();
+      final studentId = await _getStudentId();
+
+      if (studentId == null || studentId.isEmpty) {
+        onError?.call('Not logged in or student profile not found');
+        return;
+      }
+
+      final sessionInfo = await _discoverSession(minor);
+      if (sessionInfo == null) {
+        onNoSession?.call();
+        return;
+      }
+
+      _currentSessionId = sessionInfo['sessionId'];
+      _currentClassId = sessionInfo['classId'];
 
       final response = await http.post(
         Uri.parse("$baseUrl/attendance/check-in"),
         headers: {"Content-Type": "application/json"},
         body: jsonEncode({
-          "studentId": "STU_0080", // TODO: Get from auth
-          "classId": "CS101",      // TODO: Get from active session lookup
-          "sessionId": _currentSessionId ?? "YOUR_SESSION_UUID", // TODO: Fetch active session
+          "studentId": studentId,
+          "classId": sessionInfo['classId'],
+          "sessionId": sessionInfo['sessionId'],
           "deviceId": deviceId,
           "deviceSignature": signature,
           "reportedMinor": minor,
@@ -144,8 +268,6 @@ class AttendanceService {
 
       if (response.statusCode == 201) {
         onSuccess?.call();
-        
-        // If new pipeline is enabled, start RSSI streaming
         if (isNewPipeline) {
           _startRssiStreaming(minor);
         }
@@ -154,10 +276,10 @@ class AttendanceService {
         if (body['error'] == 'No active session found for this class') {
           onNoSession?.call();
         } else {
-          onError?.call(body['message'] ?? body['error'] ?? 'Check-in rejected');
+          onError?.call(
+              body['message'] ?? body['error'] ?? 'Check-in rejected');
         }
       } else if (response.statusCode == 200) {
-        // Already checked in
         onSuccess?.call();
       } else {
         final body = jsonDecode(response.body);
@@ -168,125 +290,107 @@ class AttendanceService {
     }
   }
 
-  /// 📡 Start 45-minute RSSI Streaming (New Pipeline)
+  /// Start 45-minute RSSI Streaming (New Pipeline)
   void _startRssiStreaming(int beaconMinor) {
     if (_isStreaming) return;
-    
     _isStreaming = true;
-    print("🔄 Starting 45-minute RSSI streaming...");
+    print("[AttendanceService] Starting RSSI streaming...");
 
-    // Stream RSSI data every 30 seconds for 45 minutes
     int streamCount = 0;
-    const maxStreams = 90; // 45 min * 2 per minute
+    const maxStreams = 90;
 
-    _rssiStreamTimer = Timer.periodic(const Duration(seconds: 30), (timer) async {
+    _rssiStreamTimer =
+        Timer.periodic(const Duration(seconds: 30), (timer) async {
       streamCount++;
-      
       if (streamCount >= maxStreams) {
         stopRssiStreaming();
         return;
       }
-
-      // Quick scan for RSSI reading
       await _captureAndSendRssi();
     });
   }
 
-  /// 📤 Capture RSSI and Send to Backend
+  /// Capture RSSI and Send to Backend using native beacon ranging
   Future<void> _captureAndSendRssi() async {
+    if (_isScanInProgress) return;
+    _isScanInProgress = true;
+
     try {
       List<Map<String, dynamic>> rssiReadings = [];
 
-      // Quick 2-second scan to capture current RSSI
-      FlutterBluePlus.scanResults.listen((results) {
-        for (ScanResult r in results) {
-          final beaconData = _parseIBeacon(r.advertisementData.manufacturerData);
-          if (beaconData != null && 
-              beaconData['uuid']?.toLowerCase() == targetBeaconUUID.toLowerCase()) {
+      // Cancel any leftover ranging subscription
+      await _rangingSubscription?.cancel();
+      _rangingSubscription = null;
+
+      final regions = <Region>[
+        Region(
+          identifier: 'AttendFresh',
+          proximityUUID: targetBeaconUUID,
+        ),
+      ];
+
+      _rangingSubscription = flutterBeacon.ranging(regions).listen((result) {
+        for (final beacon in result.beacons) {
+          if (beacon.proximityUUID.toLowerCase() == targetBeaconUUID.toLowerCase()) {
             rssiReadings.add({
-              "rssi": r.rssi,
+              "rssi": beacon.rssi,
               "timestamp": DateTime.now().toIso8601String(),
-              "minor": beaconData['minor'],
+              "minor": beacon.minor,
             });
           }
         }
       });
 
-      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 2));
+      // Range for 3 seconds
       await Future.delayed(const Duration(seconds: 3));
+
+      // Clean up
+      await _rangingSubscription?.cancel();
+      _rangingSubscription = null;
 
       if (rssiReadings.isNotEmpty) {
         await _sendRssiStream(rssiReadings);
       }
     } catch (e) {
-      print("❌ RSSI capture error: $e");
+      print("[AttendanceService] RSSI capture error: $e");
+    } finally {
+      _isScanInProgress = false;
     }
   }
 
-  /// 📤 Send RSSI Stream to Backend
+  /// Send RSSI Stream to Backend
   Future<void> _sendRssiStream(List<Map<String, dynamic>> rssiData) async {
     try {
+      final studentId = await _getStudentId();
       final response = await http.post(
         Uri.parse("$baseUrl/attendance/stream-rssi"),
         headers: {"Content-Type": "application/json"},
         body: jsonEncode({
-          "studentId": "STU_0080",
-          "classId": "CS101",
+          "studentId": studentId ?? "UNKNOWN",
+          "classId": _currentClassId ?? "",
           "rssiData": rssiData,
         }),
       );
-
       if (response.statusCode == 200) {
-        print("✅ RSSI stream sent: ${rssiData.length} readings");
+        print("[AttendanceService] RSSI stream sent: ${rssiData.length} readings");
       }
     } catch (e) {
-      print("❌ RSSI stream error: $e");
+      print("[AttendanceService] RSSI stream error: $e");
     }
   }
 
-  /// 🛑 Stop RSSI Streaming
+  /// Stop RSSI Streaming
   void stopRssiStreaming() {
     _rssiStreamTimer?.cancel();
     _rssiStreamTimer = null;
     _isStreaming = false;
-    print("⏹️ RSSI streaming stopped");
+    print("[AttendanceService] RSSI streaming stopped");
   }
 
-  /// 🔍 Parse iBeacon from Manufacturer Data
-  Map<String, dynamic>? _parseIBeacon(Map<int, List<int>> manufacturerData) {
-    // Apple Company ID is 0x004C (76 in decimal)
-    final appleData = manufacturerData[76];
-    if (appleData == null || appleData.length < 23) return null;
-
-    // iBeacon format: 02 15 [UUID 16 bytes] [Major 2 bytes] [Minor 2 bytes] [TX Power 1 byte]
-    if (appleData[0] != 0x02 || appleData[1] != 0x15) return null;
-
-    // Extract UUID (bytes 2-17)
-    final uuidBytes = appleData.sublist(2, 18);
-    final uuid = uuidBytes
-        .map((b) => b.toRadixString(16).padLeft(2, '0'))
-        .join()
-        .replaceAllMapped(
-          RegExp(r'(.{8})(.{4})(.{4})(.{4})(.{12})'),
-          (m) => '${m[1]}-${m[2]}-${m[3]}-${m[4]}-${m[5]}',
-        );
-
-    // Extract Major (bytes 18-19)
-    final major = (appleData[18] << 8) + appleData[19];
-
-    // Extract Minor (bytes 20-21)
-    final minor = (appleData[20] << 8) + appleData[21];
-
-    return {
-      'uuid': uuid,
-      'major': major,
-      'minor': minor,
-    };
-  }
-
-  /// 🧹 Cleanup
+  /// Cleanup
   void dispose() {
     stopRssiStreaming();
-    FlutterBluePlus.stopScan();
+    _rangingSubscription?.cancel();
+    _rangingSubscription = null;
   }
 }

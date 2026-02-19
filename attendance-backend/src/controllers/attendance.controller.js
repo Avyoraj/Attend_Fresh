@@ -17,7 +17,7 @@ exports.checkIn = async (req, res) => {
     // 2. Get session with dynamic beacon info
     const { data: session } = await supabaseAdmin
       .from('sessions')
-      .select('status, current_minor_id, last_rotation_at, rotation_interval_mins')
+      .select('status, current_minor_id, beacon_minor, last_rotation_at, rotation_interval_mins')
       .eq('id', sessionId)
       .single();
 
@@ -26,23 +26,27 @@ exports.checkIn = async (req, res) => {
     }
 
     // 3. 🎯 Dynamic ID Validation (The "Challenge" Gate)
-    if (reportedMinor !== session.current_minor_id) {
+    // Accept if minor matches current_minor_id OR the original beacon_minor (fallback)
+    const expectedMinor = session.current_minor_id ?? session.beacon_minor;
+    if (reportedMinor !== expectedMinor) {
       return res.status(403).json({ 
         error: 'Invalid Beacon ID', 
-        message: 'Failed Human Presence Check (ID Mismatch)' 
+        message: `Failed Human Presence Check (ID Mismatch: got ${reportedMinor}, expected ${expectedMinor})` 
       });
     }
 
-    // 4. 🕐 Strict rotation expiry check (Demo: 3-minute window)
-    const now = new Date();
-    const lastRotation = new Date(session.last_rotation_at);
-    const diffMinutes = (now - lastRotation) / 60000;
+    // 4. 🕐 Rotation expiry check (skip if last_rotation_at is null — session just started)
+    if (session.last_rotation_at && session.rotation_interval_mins) {
+      const now = new Date();
+      const lastRotation = new Date(session.last_rotation_at);
+      const diffMinutes = (now - lastRotation) / 60000;
 
-    if (diffMinutes > session.rotation_interval_mins) {
-      return res.status(403).json({ 
-        error: 'Beacon Expired', 
-        message: `Please wait for the next beacon rotation (Window: ${session.rotation_interval_mins} min)` 
-      });
+      if (diffMinutes > session.rotation_interval_mins) {
+        return res.status(403).json({ 
+          error: 'Beacon Expired', 
+          message: `Please wait for the next beacon rotation (Window: ${session.rotation_interval_mins} min)` 
+        });
+      }
     }
 
     // 5. Create provisional record

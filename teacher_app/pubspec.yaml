@@ -35,10 +35,12 @@ dependencies:
   supabase_flutter: ^2.3.0
   # HTTP requests to backend
   http: ^1.1.0
-  # BLE for beacon monitoring
-  flutter_blue_plus: 1.15.0
+  # iBeacon ranging (native OS-level API — reliable on all Android devices)
+  flutter_beacon: ^0.5.1
   # Persistent storage
   shared_preferences: ^2.2.2
+  # Runtime permission requests (BLE, Location)
+  permission_handler: ^11.3.0
 
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.

@@ -1,123 +1,145 @@
 import 'dart:async';
-import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'dart:io' show Platform;
+import 'package:flutter_beacon/flutter_beacon.dart';
+import 'package:permission_handler/permission_handler.dart';
 
-/// 📡 Beacon Monitor Service
+/// Beacon Monitor Service
+/// Uses native iBeacon ranging API (Android Beacon Library under the hood)
 /// Watches for ESP32 beacon rotation and notifies when Minor ID changes
 class BeaconMonitor {
-  // Configuration
-  final String targetBeaconUUID = "1a7f44b2-e25c-44a8-a634-3d0b98065d21";
-  
+  // Configuration — ESP32 broadcasts UUID in reversed byte order (hardware quirk)
+  final String targetBeaconUUID = '215d0698-0b3d-34a6-a844-5ce2b2447f1a';
+
   // State
   int? _lastDetectedMinor;
   Timer? _scanTimer;
   bool _isMonitoring = false;
-  
+  StreamSubscription<RangingResult>? _rangingSubscription;
+
   // Callback for rotation detection
   Function(int newMinor)? onBeaconRotation;
 
-  /// 🚀 Start Continuous Beacon Monitoring
-  /// Scans every 30 seconds to detect Minor ID changes
+  /// Start Continuous Beacon Monitoring
   Future<void> startMonitoring({
     required Function(int newMinor) onRotation,
     Duration scanInterval = const Duration(seconds: 30),
   }) async {
     if (_isMonitoring) return;
-    
+
+    // ── Explicitly request runtime permissions (Android 12+ needs BLUETOOTH_SCAN) ──
+    if (Platform.isAndroid) {
+      final statuses = await [
+        Permission.bluetoothScan,
+        Permission.bluetoothConnect,
+        Permission.locationWhenInUse,
+      ].request();
+
+      print('[BeaconMonitor] Permission statuses: $statuses');
+
+      if (statuses[Permission.bluetoothScan]?.isDenied == true ||
+          statuses[Permission.bluetoothScan]?.isPermanentlyDenied == true) {
+        print('[BeaconMonitor] BLUETOOTH_SCAN permission denied — cannot scan');
+        return;
+      }
+      if (statuses[Permission.locationWhenInUse]?.isDenied == true ||
+          statuses[Permission.locationWhenInUse]?.isPermanentlyDenied == true) {
+        print('[BeaconMonitor] Location permission denied — cannot scan');
+        return;
+      }
+    }
+
+    // Initialize beacon scanning (after permissions are granted)
+    try {
+      await flutterBeacon.initializeAndCheckScanning;
+      print('[BeaconMonitor] Beacon scanning initialized');
+    } catch (e) {
+      print('[BeaconMonitor] Beacon init error: $e');
+      return;
+    }
+
     _isMonitoring = true;
     onBeaconRotation = onRotation;
-    
-    print("📡 Starting beacon monitoring...");
 
-    // Initial scan
+    print('[BeaconMonitor] Starting...');
+
     await _performScan();
 
-    // Periodic scanning
     _scanTimer = Timer.periodic(scanInterval, (_) async {
       await _performScan();
     });
   }
 
-  /// 🛑 Stop Monitoring
+  /// Stop Monitoring
   void stopMonitoring() {
     _scanTimer?.cancel();
     _scanTimer = null;
     _isMonitoring = false;
     _lastDetectedMinor = null;
-    FlutterBluePlus.stopScan();
-    print("⏹️ Beacon monitoring stopped");
+    _rangingSubscription?.cancel();
+    _rangingSubscription = null;
+    print('[BeaconMonitor] Stopped');
   }
 
-  /// 🔍 Perform a Single Scan
+  /// Perform a Single Scan using native iBeacon ranging
   Future<void> _performScan() async {
     try {
-      FlutterBluePlus.scanResults.listen((results) {
-        for (ScanResult r in results) {
-          final beaconData = _parseIBeacon(r.advertisementData.manufacturerData);
-          
-          if (beaconData != null && 
-              beaconData['uuid']?.toLowerCase() == targetBeaconUUID.toLowerCase()) {
-            
-            final minor = beaconData['minor'] as int;
-            
-            // Check if Minor ID has changed (rotation detected!)
-            if (_lastDetectedMinor != null && _lastDetectedMinor != minor) {
-              print("🔄 Beacon rotation detected! Minor: $_lastDetectedMinor → $minor");
-              onBeaconRotation?.call(minor);
-            }
-            
-            _lastDetectedMinor = minor;
-          }
-        }
-      });
+      // Cancel any previous ranging
+      await _rangingSubscription?.cancel();
+      _rangingSubscription = null;
 
-      await FlutterBluePlus.startScan(
-        timeout: const Duration(seconds: 5),
+      final regions = <Region>[
+        Region(
+          identifier: 'AttendFresh',
+          proximityUUID: targetBeaconUUID,
+        ),
+      ];
+
+      print('[BeaconMonitor] Starting iBeacon ranging...');
+
+      _rangingSubscription = flutterBeacon.ranging(regions).listen(
+        (RangingResult result) {
+          final beacons = result.beacons;
+          if (beacons.isNotEmpty) {
+            print('[BeaconMonitor] Ranging: ${beacons.length} beacon(s)');
+          }
+
+          for (final beacon in beacons) {
+            print('[BeaconMonitor] Beacon: uuid=${beacon.proximityUUID} '
+                'major=${beacon.major} minor=${beacon.minor} '
+                'rssi=${beacon.rssi} accuracy=${beacon.accuracy}m');
+
+            if (beacon.proximityUUID.toLowerCase() == targetBeaconUUID.toLowerCase()) {
+              final minor = beacon.minor;
+              if (_lastDetectedMinor == null || _lastDetectedMinor != minor) {
+                print('[BeaconMonitor] *** TARGET MATCH *** Minor: $minor');
+                _lastDetectedMinor = minor;
+                onBeaconRotation?.call(minor);
+              }
+            }
+          }
+        },
+        onError: (error) {
+          print('[BeaconMonitor] Ranging error: $error');
+        },
       );
 
+      // Range for 6 seconds then stop
+      await Future.delayed(const Duration(seconds: 6));
+
+      await _rangingSubscription?.cancel();
+      _rangingSubscription = null;
+
+      print('[BeaconMonitor] Scan cycle complete');
     } catch (e) {
-      print("❌ Scan error: $e");
+      print('[BeaconMonitor] Scan error: $e');
+      await _rangingSubscription?.cancel();
+      _rangingSubscription = null;
     }
   }
 
-  /// 🔍 Parse iBeacon from Manufacturer Data
-  Map<String, dynamic>? _parseIBeacon(Map<int, List<int>> manufacturerData) {
-    // Apple Company ID is 0x004C (76 in decimal)
-    final appleData = manufacturerData[76];
-    if (appleData == null || appleData.length < 23) return null;
-
-    // iBeacon format: 02 15 [UUID 16 bytes] [Major 2 bytes] [Minor 2 bytes] [TX Power 1 byte]
-    if (appleData[0] != 0x02 || appleData[1] != 0x15) return null;
-
-    // Extract UUID (bytes 2-17)
-    final uuidBytes = appleData.sublist(2, 18);
-    final uuid = uuidBytes
-        .map((b) => b.toRadixString(16).padLeft(2, '0'))
-        .join()
-        .replaceAllMapped(
-          RegExp(r'(.{8})(.{4})(.{4})(.{4})(.{12})'),
-          (m) => '${m[1]}-${m[2]}-${m[3]}-${m[4]}-${m[5]}',
-        );
-
-    // Extract Major (bytes 18-19)
-    final major = (appleData[18] << 8) + appleData[19];
-
-    // Extract Minor (bytes 20-21)
-    final minor = (appleData[20] << 8) + appleData[21];
-
-    return {
-      'uuid': uuid,
-      'major': major,
-      'minor': minor,
-    };
-  }
-
-  /// 📊 Get Current Minor ID
   int? get currentMinor => _lastDetectedMinor;
-  
-  /// 🔄 Is Currently Monitoring
   bool get isMonitoring => _isMonitoring;
 
-  /// 🧹 Cleanup
   void dispose() {
     stopMonitoring();
   }

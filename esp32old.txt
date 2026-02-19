@@ -1,0 +1,40 @@
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEBeacon.h>
+
+#define IBEACON_UUID "1a7f44b2-e25c-44a8-a634-3d0b98065d21" 
+#define IBEACON_MAJOR 1
+#define IBEACON_MINOR 101
+
+BLEAdvertising *pAdvertising;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Starting BLE Beacon...");
+
+  BLEDevice::init("ESP32_Beacon");
+
+  pAdvertising = BLEDevice::getAdvertising();
+
+  BLEBeacon beacon;
+  beacon.setManufacturerId(0x4C00); // Apple
+  beacon.setProximityUUID(BLEUUID(IBEACON_UUID));
+  beacon.setMajor(IBEACON_MAJOR);
+  beacon.setMinor(IBEACON_MINOR);
+  beacon.setSignalPower(0xc5);
+
+  BLEAdvertisementData advertisementData;
+  advertisementData.setFlags(0x06);
+  advertisementData.setManufacturerData(beacon.getData());
+
+  pAdvertising->setAdvertisementData(advertisementData);
+  pAdvertising->setScanResponse(false);
+  pAdvertising->setAdvertisementType(ADV_TYPE_NONCONN_IND);
+
+  pAdvertising->start();
+  Serial.println("Beacon broadcasting.");
+}
+
+void loop() {
+  delay(2000);
+}
