@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'main_navigation.dart';
@@ -9,6 +10,27 @@ void main() async {
   
   // Initialize SharedPreferences
   await SharedPreferences.getInstance();
+
+  // Initialize Foreground Task (keeps app alive during 5-min spot checks)
+  FlutterForegroundTask.init(
+    androidNotificationOptions: AndroidNotificationOptions(
+      channelId: 'attend_fresh_fg',
+      channelName: 'Attendance Verification',
+      channelDescription: 'Keeps attendance verification running while in class.',
+      channelImportance: NotificationChannelImportance.LOW,
+      priority: NotificationPriority.LOW,
+    ),
+    iosNotificationOptions: const IOSNotificationOptions(
+      showNotification: false,
+    ),
+    foregroundTaskOptions: ForegroundTaskOptions(
+      autoRunOnBoot: false,
+      autoRunOnMyPackageReplaced: false,
+      allowWakeLock: true,
+      allowWifiLock: false,
+      eventAction: ForegroundTaskEventAction.nothing(),
+    ),
+  );
 
   // Initialize Supabase
   await Supabase.initialize(

@@ -47,6 +47,10 @@ dependencies:
   permission_handler: ^11.3.0
   # Biometric authentication (fingerprint fallback)
   local_auth: ^2.3.0
+  # Accelerometer for motion detection (phone on desk vs in hand)
+  sensors_plus: ^6.1.1
+  # Foreground service to survive 5-min verification window
+  flutter_foreground_task: ^8.7.0
 
 
   # The following adds the Cupertino Icons font to your application.

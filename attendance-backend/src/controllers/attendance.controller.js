@@ -166,20 +166,22 @@ exports.verifyStep2 = async (req, res) => {
       .eq('student_id', studentId).eq('session_id', sessionId).maybeSingle();
 
     if (!att) return res.status(404).json({ error: 'No check-in found' });
-    if (att.status === 'confirmed') return res.status(200).json({ message: 'Already confirmed' });
+    if (att.status === 'confirmed' || att.status === 'step2_verified') {
+      return res.status(200).json({ message: 'Already confirmed' });
+    }
 
     // The reported minor must be DIFFERENT from the one used at check-in (proves continued presence)
     if (reportedMinor === att.beacon_minor) {
       return res.status(403).json({ error: 'Same minor as check-in', message: 'Wait for beacon rotation' });
     }
 
-    // Confirm!
+    // Step-2 passed → mark as step2_verified (NOT confirmed — that comes after analysis)
     await supabaseAdmin.from('attendance').update({
-      status: 'confirmed', confirmed_at: new Date().toISOString()
+      status: 'step2_verified', step2_verified_at: new Date().toISOString()
     }).eq('id', att.id);
 
-    console.log(`✅ Step-2 confirmed: ${studentId} (minor ${att.beacon_minor} → ${reportedMinor})`);
-    res.status(200).json({ success: true, status: 'confirmed' });
+    console.log(`✅ Step-2 verified: ${studentId} (minor ${att.beacon_minor} → ${reportedMinor})`);
+    res.status(200).json({ success: true, status: 'step2_verified' });
   } catch (error) {
     console.error('❌ Step-2 error:', error);
     res.status(500).json({ error: 'Step-2 verification failed' });
@@ -235,5 +237,119 @@ exports.biometricConfirm = async (req, res) => {
   } catch (error) {
     console.error('❌ Biometric confirm error:', error);
     res.status(500).json({ error: 'Biometric confirmation failed' });
+  }
+};
+
+/**
+ * 📊 7. Analyze Spot Check Data (5-Min Gold Window)
+ * Runs jitter + motion + correlation analysis on collected RSSI streams.
+ * Returns: confirmed (all clear) or flagged (suspicious).
+ */
+exports.analyzeSpotChecks = async (req, res) => {
+  try {
+    const { studentId, sessionId, classId } = req.body;
+    const today = new Date().toISOString().split('T')[0];
+
+    // 1. Get this student's RSSI stream
+    const { data: stream } = await supabaseAdmin
+      .from('rssi_streams')
+      .select('rssi_data')
+      .eq('student_id', studentId)
+      .eq('class_id', classId)
+      .eq('session_date', today)
+      .maybeSingle();
+
+    if (!stream || !stream.rssi_data || stream.rssi_data.length === 0) {
+      // No data collected → inconclusive, let biometric handle it
+      console.log(`⚠️ Analyze: No RSSI data for ${studentId} — inconclusive`);
+      return res.status(200).json({ status: 'inconclusive', reason: 'No spot check data received' });
+    }
+
+    const readings = stream.rssi_data;
+    const validReadings = readings.filter(r => !r.missed);
+    const missedCount = readings.filter(r => r.missed).length;
+
+    // 2. Check for missed spot checks (app killed / student left)
+    if (missedCount >= 2) {
+      console.log(`🚩 Analyze: ${studentId} missed ${missedCount} spot checks — flagged`);
+      await supabaseAdmin.from('attendance').update({ status: 'flagged' })
+        .eq('student_id', studentId).eq('session_id', sessionId);
+      return res.status(200).json({ status: 'flagged', reason: 'Missed spot checks' });
+    }
+
+    // 3. Motion analysis — was the phone actually being held?
+    const motionCount = validReadings.filter(r => r.hasMotion === true).length;
+    const motionRatio = validReadings.length > 0 ? motionCount / validReadings.length : 0;
+
+    // 4. Jitter analysis — RSSI variation (phone on desk = near-zero jitter)
+    let jitter = 0;
+    if (validReadings.length >= 2) {
+      const rssiValues = validReadings.map(r => r.rssi);
+      const diffs = rssiValues.slice(1).map((v, i) => Math.abs(v - rssiValues[i]));
+      jitter = diffs.reduce((a, b) => a + b, 0) / diffs.length;
+    }
+
+    // 5. Scoring
+    let riskScore = 0;
+    let reasons = [];
+
+    // Static device: no motion + low jitter = phone on desk
+    if (motionRatio < 0.3) { riskScore += 40; reasons.push('Low motion detected'); }
+    if (jitter < 0.5 && validReadings.length >= 3) { riskScore += 30; reasons.push('Static RSSI (desk?)'); }
+    if (missedCount >= 1) { riskScore += 20; reasons.push('Missed a spot check'); }
+
+    // 6. Pairwise correlation (if other students have streams for this session)
+    const { data: allStreams } = await supabaseAdmin
+      .from('rssi_streams')
+      .select('student_id, rssi_data')
+      .eq('class_id', classId)
+      .eq('session_date', today)
+      .neq('student_id', studentId);
+
+    if (allStreams && allStreams.length > 0) {
+      const myRssi = validReadings.map(r => r.rssi);
+      for (const other of allStreams) {
+        const otherValid = (other.rssi_data || []).filter(r => !r.missed);
+        if (otherValid.length < 3) continue;
+        const otherRssi = otherValid.map(r => r.rssi);
+
+        const len = Math.min(myRssi.length, otherRssi.length);
+        if (len < 3) continue;
+
+        // Pearson correlation
+        const x = myRssi.slice(0, len), y = otherRssi.slice(0, len);
+        const muX = x.reduce((a, b) => a + b, 0) / len;
+        const muY = y.reduce((a, b) => a + b, 0) / len;
+        let num = 0, sqX = 0, sqY = 0;
+        for (let i = 0; i < len; i++) {
+          num += (x[i] - muX) * (y[i] - muY);
+          sqX += (x[i] - muX) ** 2;
+          sqY += (y[i] - muY) ** 2;
+        }
+        const denom = Math.sqrt(sqX * sqY);
+        const pearson = denom === 0 ? 0 : num / denom;
+
+        if (pearson > 0.85) {
+          riskScore += 50;
+          reasons.push(`High correlation (${pearson.toFixed(2)}) with ${other.student_id}`);
+          break; // One high correlation is enough
+        }
+      }
+    }
+
+    // 7. Verdict
+    const isFlagged = riskScore >= 60;
+    const newStatus = isFlagged ? 'flagged' : 'confirmed';
+
+    await supabaseAdmin.from('attendance').update({
+      status: newStatus,
+      ...(newStatus === 'confirmed' ? { confirmed_at: new Date().toISOString() } : {})
+    }).eq('student_id', studentId).eq('session_id', sessionId);
+
+    console.log(`📊 Analyze: ${studentId} → ${newStatus} (risk=${riskScore}, reasons=${reasons.join(', ')})`);
+    res.status(200).json({ status: newStatus, riskScore, reasons });
+  } catch (error) {
+    console.error('❌ Analyze error:', error);
+    res.status(500).json({ error: 'Analysis failed' });
   }
 };

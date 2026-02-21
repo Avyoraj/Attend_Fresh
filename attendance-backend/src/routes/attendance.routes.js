@@ -8,5 +8,6 @@ router.post('/finalize', c.finalizeVerification);
 router.post('/verify-step2', c.verifyStep2);
 router.post('/biometric-confirm', c.biometricConfirm);
 router.post('/reset-device', c.resetDevice);
+router.post('/analyze', c.analyzeSpotChecks);
 
 module.exports = router;

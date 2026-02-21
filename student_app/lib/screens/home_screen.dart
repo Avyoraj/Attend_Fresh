@@ -93,7 +93,7 @@ class _HomeScreenState extends State<HomeScreen> {
             .select('id')
             .eq('student_id', _studentId)
             .gte('session_date', weekStartStr)
-            .inFilter('status', ['confirmed', 'provisional']);
+            .inFilter('status', ['confirmed', 'provisional', 'step2_verified']);
 
         _attendedClasses = (attendedThisWeek as List).length;
 
@@ -123,7 +123,7 @@ class _HomeScreenState extends State<HomeScreen> {
             'name': s['class_name'] ?? s['class_id'] ?? 'Unknown',
             'time': _formatTime(s['actual_start']),
             'room': s['room_id'] ?? '',
-            'attended': attStatus == 'confirmed' || attStatus == 'provisional',
+            'attended': attStatus == 'confirmed' || attStatus == 'provisional' || attStatus == 'step2_verified',
             'status': attStatus,
           };
         }).toList();
@@ -157,6 +157,12 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _startScanning() async {
+    // ── Guard: never start a new scan while a verification flow is active ──
+    if (_attendanceService.isVerificationActive) {
+      print('[HomeScreen] Skipping scan — verification already active (${_attendanceService.stage})');
+      return;
+    }
+
     if (_scanRetryCount == 0) {
       // Only reset UI for first scan, not retries
     }
@@ -181,6 +187,8 @@ class _HomeScreenState extends State<HomeScreen> {
           });
         },
         onCheckInSuccess: () {
+          _retryTimer?.cancel();  // Kill retries — verification flow owns BLE now
+          _scanRetryCount = 0;
           setState(() {
             _statusTitle = "✅ Attendance Recorded";
             _statusSubtitle = "Status: Provisional — verifying presence...";
@@ -244,13 +252,69 @@ class _HomeScreenState extends State<HomeScreen> {
         onStep2Confirmed: () {
           if (!mounted) return;
           setState(() {
-            _statusTitle = "✅ Attendance Confirmed";
-            _statusSubtitle = "Step-2 verification passed!";
+            _statusTitle = "🔄 Step-2 Passed — Monitoring...";
+            _statusSubtitle = "Behavioral verification in progress (5 min)";
             _statusIcon = Icons.verified;
-            _statusColor = Colors.green;
-            _isScanning = false;
+            _statusColor = Colors.teal;
           });
-          _loadStudentData(); // refresh stats
+          // Start 5-min Gold Window spot checks
+          _attendanceService.startSpotChecks(
+            onSpotCheckActive: () {
+              if (!mounted) return;
+              setState(() {
+                _statusSubtitle = "📡 Spot checks running — stay in class";
+              });
+            },
+            onAllClear: () {
+              if (!mounted) return;
+              setState(() {
+                _statusTitle = "✅ Attendance Fully Confirmed";
+                _statusSubtitle = "All verification layers passed!";
+                _statusIcon = Icons.verified;
+                _statusColor = Colors.green;
+                _isScanning = false;
+              });
+              _loadStudentData();
+            },
+            onFlagged: () {
+              if (!mounted) return;
+              setState(() {
+                _statusTitle = "⚠️ Flagged — Verifying Identity";
+                _statusSubtitle = "Biometric confirmation required";
+                _statusIcon = Icons.warning_amber;
+                _statusColor = Colors.orange;
+              });
+            },
+            onBiometricPrompt: () {
+              if (!mounted) return;
+              setState(() {
+                _statusTitle = "🔐 Fingerprint Required";
+                _statusSubtitle = "Please verify your identity";
+                _statusIcon = Icons.fingerprint;
+                _statusColor = Colors.deepPurple;
+              });
+            },
+            onBiometricConfirmed: () {
+              if (!mounted) return;
+              setState(() {
+                _statusTitle = "✅ Attendance Confirmed";
+                _statusSubtitle = "Biometric verification passed!";
+                _statusIcon = Icons.verified;
+                _statusColor = Colors.green;
+                _isScanning = false;
+              });
+              _loadStudentData();
+            },
+            onError: (error) {
+              if (!mounted) return;
+              setState(() {
+                _statusTitle = "⚠️ Verification Issue";
+                _statusSubtitle = error;
+                _statusIcon = Icons.info_outline;
+                _statusColor = Colors.orange;
+              });
+            },
+          );
         },
         onBiometricPrompt: () {
           if (!mounted) return;

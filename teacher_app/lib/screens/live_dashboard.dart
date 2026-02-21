@@ -25,7 +25,7 @@ class _LiveDashboardState extends State<LiveDashboard> {
   final BeaconMonitor _beaconMonitor = BeaconMonitor();
 
   List<Map<String, dynamic>> _liveAttendees = [];
-  Map<String, int> _stats = {'total': 0, 'confirmed': 0, 'provisional': 0, 'flagged': 0};
+  Map<String, int> _stats = {'total': 0, 'confirmed': 0, 'provisional': 0, 'step2_verified': 0, 'flagged': 0};
   int? _currentMinor;
   bool _isBeaconSyncing = false;
   Timer? _pollTimer;
@@ -181,7 +181,7 @@ class _LiveDashboardState extends State<LiveDashboard> {
         children: [
           _buildStatItem("Total", _stats['total']!, Colors.blue),
           _buildStatItem("Confirmed", _stats['confirmed']!, Colors.green),
-          _buildStatItem("Provisional", _stats['provisional']!, Colors.orange),
+          _buildStatItem("Verifying", (_stats['provisional']! + _stats['step2_verified']!), Colors.teal),
           _buildStatItem("Flagged", _stats['flagged']!, Colors.red),
         ],
       ),
@@ -250,6 +250,10 @@ class _LiveDashboardState extends State<LiveDashboard> {
         statusColor = Colors.green;
         statusIcon = Icons.check_circle;
         break;
+      case 'step2_verified':
+        statusColor = Colors.teal;
+        statusIcon = Icons.hourglass_top;
+        break;
       case 'provisional':
         statusColor = Colors.orange;
         statusIcon = Icons.pending;
@@ -263,7 +267,9 @@ class _LiveDashboardState extends State<LiveDashboard> {
         statusIcon = Icons.help;
     }
 
-    return Container(
+    return GestureDetector(
+      onLongPress: () => _showStudentActions(student),
+      child: Container(
       margin: const EdgeInsets.only(bottom: 12),
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
@@ -343,7 +349,7 @@ class _LiveDashboardState extends State<LiveDashboard> {
           ],
         ],
       ),
-    );
+    ));
   }
 
   Widget _buildInfoChip(IconData icon, String label) {
@@ -388,6 +394,107 @@ class _LiveDashboardState extends State<LiveDashboard> {
         SnackBar(
           content: Text("✅ ${student['student_id']} confirmed"),
           backgroundColor: Colors.green,
+        ),
+      );
+    }
+  }
+
+  void _showStudentActions(Map<String, dynamic> student) {
+    final studentId = student['student_id'] as String? ?? 'Unknown';
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(
+                  "Student: $studentId",
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                ),
+              ),
+              ListTile(
+                leading: const Icon(Icons.verified_user, color: Colors.green),
+                title: const Text("Confirm Attendance"),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _confirmStudent(student);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.phonelink_erase, color: Colors.orange),
+                title: const Text("Reset Device Binding"),
+                subtitle: const Text("Allow student to check in from a new phone"),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _resetDevice(studentId);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.cancel, color: Colors.red),
+                title: const Text("Mark Absent"),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _teacherService.markAsAbsent(
+                    student['id'],
+                    'Marked absent by teacher from live dashboard',
+                  );
+                  if (mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text("❌ $studentId marked absent"),
+                        backgroundColor: Colors.red,
+                      ),
+                    );
+                  }
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _resetDevice(String studentId) async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text("Reset Device?"),
+        content: Text(
+          "This will unbind $studentId from their current phone. "
+          "They will need to check in again to bind a new device.",
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text("Cancel"),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
+            child: const Text("Reset"),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm != true) return;
+
+    final success = await _teacherService.resetStudentDevice(studentId);
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(success
+              ? "🔓 Device reset for $studentId"
+              : "❌ Failed to reset device"),
+          backgroundColor: success ? Colors.green : Colors.red,
         ),
       );
     }

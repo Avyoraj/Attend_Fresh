@@ -133,17 +133,19 @@ class TeacherService {
       int total = response.length;
       int confirmed = response.where((r) => r['status'] == 'confirmed').length;
       int provisional = response.where((r) => r['status'] == 'provisional').length;
+      int step2Verified = response.where((r) => r['status'] == 'step2_verified').length;
       int flagged = response.where((r) => r['status'] == 'flagged').length;
 
       return {
         'total': total,
         'confirmed': confirmed,
         'provisional': provisional,
+        'step2_verified': step2Verified,
         'flagged': flagged,
       };
     } catch (e) {
       print("❌ Error fetching stats: $e");
-      return {'total': 0, 'confirmed': 0, 'provisional': 0, 'flagged': 0};
+      return {'total': 0, 'confirmed': 0, 'provisional': 0, 'step2_verified': 0, 'flagged': 0};
     }
   }
 
@@ -210,6 +212,28 @@ class TeacherService {
     } catch (e) {
       print("❌ Error fetching rooms: $e");
       return [];
+    }
+  }
+
+  /// 🔓 Reset Student Device Binding
+  /// Allows student to check in from a new phone
+  Future<bool> resetStudentDevice(String studentId) async {
+    try {
+      final response = await http.post(
+        Uri.parse("$baseUrl/attendance/reset-device"),
+        headers: {"Content-Type": "application/json"},
+        body: jsonEncode({"studentId": studentId}),
+      );
+      if (response.statusCode == 200) {
+        print("🔓 Device reset: $studentId");
+        return true;
+      } else {
+        print("❌ Device reset failed: ${response.body}");
+        return false;
+      }
+    } catch (e) {
+      print("❌ Network error: $e");
+      return false;
     }
   }
 }
